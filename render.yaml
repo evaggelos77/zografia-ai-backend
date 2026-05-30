@@ -21,6 +21,8 @@ services:
       # ---- secrets — set in Render dashboard (sync:false) ----
       - key: OPENAI_API_KEY
         sync: false
+      - key: AKOOL_API_KEY
+        sync: false
       - key: STRIPE_SECRET_KEY
         sync: false
       - key: STRIPE_WEBHOOK_SECRET

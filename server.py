@@ -28,22 +28,30 @@ import io
 import json
 import os
 import re
+import secrets
 import sqlite3
 import time
 from contextlib import contextmanager
 from typing import Optional
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
 
 # --- Config -----------------------------------------------------------------
 DB_PATH = os.environ.get("DB_PATH", "/var/data/zografia.db")
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/var/data/uploads")
 
-TRIAL_LIMIT = 3
-BASIC_LIMIT = 15  # per Stripe billing period
+TRIAL_LIMIT = 2
+BASIC_LIMIT = 5   # per Stripe billing period
+FULL_LIMIT  = 15  # per Stripe billing period (full monthly)
+YEARLY_LIMIT = 180  # full yearly cap (~15/month) — Phase 2 will offer top-ups
+
+AKOOL_API_KEY = os.environ.get("AKOOL_API_KEY", "").strip()
+AKOOL_BASE    = "https://openapi.akool.com/api/open/v3"
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL", "https://zografia-ai.onrender.com"
 ).rstrip("/")
@@ -101,6 +109,9 @@ def _init_db():
         )
 _init_db()
 
+# Ensure upload dir exists (we save resized drawings here so AKOOL can fetch them)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 
 @contextmanager
 def db():
@@ -148,7 +159,8 @@ def _refresh_billing_period(dev: dict) -> dict:
 
 
 def _quota_for(plan: str) -> Optional[int]:
-    if plan == "full":   return None
+    if plan == "yearly": return YEARLY_LIMIT
+    if plan == "full":   return FULL_LIMIT
     if plan == "basic":  return BASIC_LIMIT
     return TRIAL_LIMIT
 
@@ -157,19 +169,19 @@ def _plan_status_dict(dev: dict) -> dict:
     plan = dev.get("plan") or "trial"
     status = dev.get("plan_status") or "active"
     is_active = status == "active"
-    is_full = (plan == "full") and is_active
+    is_paid = plan in ("basic", "full", "yearly") and is_active
     quota = _quota_for(plan if is_active else "trial")
     used = int(dev.get("uses") or 0)
-    remaining = None if quota is None else max(0, quota - used)
+    remaining = max(0, quota - used) if quota is not None else None
     return {
         "device_id": dev["id"],
         "plan": plan,
         "plan_status": status,
-        "is_full": is_full,
+        "is_paid": is_paid,
         "is_active": is_active,
         "used": used,
-        "quota": quota,                 # None = unlimited
-        "remaining": remaining,         # None = unlimited
+        "quota": quota,
+        "remaining": remaining,
         "current_period_end": int(dev.get("current_period_end") or 0),
     }
 
@@ -245,13 +257,81 @@ def stripe_module():
 PLAN_FROM_PRICE = {
     PRICE_BASIC_MONTHLY: "basic",
     PRICE_FULL_MONTHLY:  "full",
-    PRICE_FULL_YEARLY:   "full",
+    PRICE_FULL_YEARLY:   "yearly",
 }
 
 
 # ============================================================================
 # Routes
 # ============================================================================
+# --- AKOOL Image-to-Video ---------------------------------------------------
+def _save_image_to_disk(data_url: str) -> str:
+    """Decode a data URL, save under UPLOAD_DIR, return the public name (without ext)."""
+    if not data_url or ";base64," not in data_url:
+        raise HTTPException(status_code=400, detail="image data URL required")
+    b64 = data_url.split(";base64,", 1)[1]
+    try:
+        raw = base64.b64decode(b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="image not base64-decodable")
+    if len(raw) > 6 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="image too large")
+    name = secrets.token_urlsafe(18)
+    with open(os.path.join(UPLOAD_DIR, name + ".jpg"), "wb") as f:
+        f.write(raw)
+    return name
+
+
+@app.get("/uploads/{name}.jpg")
+def get_upload(name: str):
+    safe = re.sub(r"[^A-Za-z0-9_-]", "", name)[:64]
+    if not safe:
+        raise HTTPException(status_code=404, detail="not found")
+    path = os.path.join(UPLOAD_DIR, safe + ".jpg")
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="not found")
+    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+
+
+# AKOOL Image-to-Video model IDs (v3 OpenAPI). 401 = standard / cheaper plan.
+AKOOL_MODEL_ID = int(os.environ.get("AKOOL_MODEL_ID", "401"))
+
+
+def _akool_start(image_public_url: str, prompt: str = "") -> dict:
+    if not AKOOL_API_KEY:
+        raise HTTPException(status_code=503, detail="AKOOL_API_KEY not set")
+    payload = {
+        "url": image_public_url,
+        "model_id": AKOOL_MODEL_ID,
+        "prompt": (prompt or "Gentle, subtle motion. Do not change colors, lines or style. No new objects, no zoom, no crop.")[:500],
+        "duration": 5,
+    }
+    headers = {"Authorization": f"Bearer {AKOOL_API_KEY}", "Content-Type": "application/json"}
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(f"{AKOOL_BASE}/content/video/createbyimage", json=payload, headers=headers)
+            r.raise_for_status()
+            return r.json() or {}
+    except httpx.HTTPError as e:
+        print(f"[akool start] http error: {e!r}")
+        raise HTTPException(status_code=502, detail=f"AKOOL start error: {type(e).__name__}")
+
+
+def _akool_status(task_id: str) -> dict:
+    if not AKOOL_API_KEY:
+        raise HTTPException(status_code=503, detail="AKOOL_API_KEY not set")
+    headers = {"Authorization": f"Bearer {AKOOL_API_KEY}"}
+    try:
+        with httpx.Client(timeout=20.0) as client:
+            r = client.get(f"{AKOOL_BASE}/content/video/infobymodelid",
+                          params={"task_id": task_id}, headers=headers)
+            r.raise_for_status()
+            return r.json() or {}
+    except httpx.HTTPError as e:
+        print(f"[akool status] http error: {e!r}")
+        raise HTTPException(status_code=502, detail=f"AKOOL status error: {type(e).__name__}")
+
+
 @app.get("/api/health")
 def health():
     return {
@@ -260,6 +340,25 @@ def health():
         "openai_configured": bool(os.environ.get("OPENAI_API_KEY", "").strip()),
         "stripe_configured": bool(STRIPE_SECRET_KEY),
         "prices_configured": all([PRICE_BASIC_MONTHLY, PRICE_FULL_MONTHLY, PRICE_FULL_YEARLY]),
+        "akool_configured":  bool(AKOOL_API_KEY),
+    }
+
+
+@app.get("/api/animate-status")
+def animate_status(task_id: str):
+    """Poll AKOOL for a video task. Returns {status, video_url?, raw}."""
+    if not task_id:
+        raise HTTPException(status_code=400, detail="task_id required")
+    data = _akool_status(task_id)
+    body = (data.get("data") or {}) if isinstance(data, dict) else {}
+    # AKOOL video_status: 1=queueing 2=processing 3=success 4=failed
+    vstat = body.get("video_status") or body.get("status") or 0
+    video_url = body.get("video") or body.get("video_url") or ""
+    state_str = {1: "queued", 2: "processing", 3: "success", 4: "failed"}.get(int(vstat) if vstat else 0, "unknown")
+    return {
+        "status": state_str,
+        "video_url": video_url if state_str == "success" else "",
+        "raw_code": data.get("code") if isinstance(data, dict) else None,
     }
 
 
@@ -474,13 +573,42 @@ def animate_drawing(req: AnimateRequest,
         out = _validate_animation(data)
         out["speakable"] = _speakable_full_text(out)
         out["usage"]     = _plan_status_dict(dev_after)
-        return out
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
         print(f"[animate-drawing] error: {exc!r}")
         _refund(x_device_id)
         raise HTTPException(status_code=502, detail=f"OpenAI: {type(exc).__name__}: {str(exc)[:280]}")
+
+    # --- kick off the AKOOL video in the SAME call so the frontend can start
+    # polling immediately. If AKOOL fails or isn't configured, we still return
+    # the story (talking + sparkles still work).
+    out["video_task_id"] = ""
+    out["video_status"]  = "none"
+    if AKOOL_API_KEY:
+        try:
+            img_name = _save_image_to_disk(image)
+            public_url = f"{PUBLIC_BASE_URL.replace('zografia-ai', 'zografia-backend')}/uploads/{img_name}.jpg"
+            # PUBLIC_BASE_URL points to the frontend; build the backend URL by
+            # swapping the host. (Fallback if user kept default config.)
+            backend_host = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
+            if backend_host:
+                public_url = f"{backend_host}/uploads/{img_name}.jpg"
+            elif "onrender.com" in PUBLIC_BASE_URL:
+                public_url = f"https://zografia-backend.onrender.com/uploads/{img_name}.jpg"
+            akool_resp = _akool_start(public_url, prompt=(out.get("what_i_see") or ""))
+            task_id = ""
+            if isinstance(akool_resp, dict):
+                body = akool_resp.get("data") or {}
+                task_id = body.get("task_id") or body.get("_id") or ""
+            if task_id:
+                out["video_task_id"] = task_id
+                out["video_status"]  = "queued"
+        except HTTPException as he:
+            print(f"[animate-drawing AKOOL] skipped: {he.detail}")
+        except Exception as exc:
+            print(f"[animate-drawing AKOOL] error: {exc!r}")
+    return out
 
 
 # --- Stripe checkout --------------------------------------------------------
