@@ -1,0 +1,33 @@
+services:
+  - type: web
+    name: zografia-backend
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeploy: true
+    disk:
+      name: zografia-data
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11"
+      - key: DB_PATH
+        value: /var/data/zografia.db
+      - key: PUBLIC_BASE_URL
+        value: https://zografia-ai.onrender.com
+      # ---- secrets — set in Render dashboard (sync:false) ----
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: PRICE_BASIC_MONTHLY
+        sync: false
+      - key: PRICE_FULL_MONTHLY
+        sync: false
+      - key: PRICE_FULL_YEARLY
+        sync: false
