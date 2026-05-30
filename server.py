@@ -264,9 +264,25 @@ PLAN_FROM_PRICE = {
 # ============================================================================
 # Routes
 # ============================================================================
-# --- AKOOL Image-to-Video ---------------------------------------------------
+# --- AKOOL Talking-Photo + file hosting -------------------------------------
+ALLOWED_UPLOAD_EXT = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                     "mp3": "audio/mpeg", "wav": "audio/wav"}
+
+
+def _save_bytes(data: bytes, ext: str) -> str:
+    """Save bytes under UPLOAD_DIR/<random>.<ext>. Returns the filename (with ext)."""
+    ext = ext.strip(".").lower()
+    if ext not in ALLOWED_UPLOAD_EXT:
+        ext = "bin"
+    if len(data) > 8 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="file too large")
+    name = secrets.token_urlsafe(18)
+    with open(os.path.join(UPLOAD_DIR, f"{name}.{ext}"), "wb") as f:
+        f.write(data)
+    return f"{name}.{ext}"
+
+
 def _save_image_to_disk(data_url: str) -> str:
-    """Decode a data URL, save under UPLOAD_DIR, return the public name (without ext)."""
     if not data_url or ";base64," not in data_url:
         raise HTTPException(status_code=400, detail="image data URL required")
     b64 = data_url.split(";base64,", 1)[1]
@@ -274,59 +290,64 @@ def _save_image_to_disk(data_url: str) -> str:
         raw = base64.b64decode(b64)
     except Exception:
         raise HTTPException(status_code=400, detail="image not base64-decodable")
-    if len(raw) > 6 * 1024 * 1024:
-        raise HTTPException(status_code=413, detail="image too large")
-    name = secrets.token_urlsafe(18)
-    with open(os.path.join(UPLOAD_DIR, name + ".jpg"), "wb") as f:
-        f.write(raw)
-    return name
+    return _save_bytes(raw, "jpg")
 
 
-@app.get("/uploads/{name}.jpg")
-def get_upload(name: str):
-    safe = re.sub(r"[^A-Za-z0-9_-]", "", name)[:64]
-    if not safe:
+@app.get("/uploads/{filename}")
+def get_upload(filename: str):
+    safe = re.sub(r"[^A-Za-z0-9._-]", "", filename)[:80]
+    if not safe or "/" in safe or ".." in safe:
         raise HTTPException(status_code=404, detail="not found")
-    path = os.path.join(UPLOAD_DIR, safe + ".jpg")
+    path = os.path.join(UPLOAD_DIR, safe)
     if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="not found")
-    return FileResponse(path, media_type="image/jpeg", headers={"Cache-Control": "public, max-age=86400"})
+    ext = safe.rsplit(".", 1)[-1].lower() if "." in safe else ""
+    mime = ALLOWED_UPLOAD_EXT.get(ext, "application/octet-stream")
+    return FileResponse(path, media_type=mime, headers={"Cache-Control": "public, max-age=86400"})
 
 
-# AKOOL Image-to-Video model IDs (v3 OpenAPI). 401 = standard / cheaper plan.
-AKOOL_MODEL_ID = int(os.environ.get("AKOOL_MODEL_ID", "401"))
+def _backend_origin() -> str:
+    """Public origin for our uploads/* files (AKOOL needs HTTPS URLs)."""
+    explicit = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
+    if explicit:
+        return explicit
+    # Derive from PUBLIC_BASE_URL (which points at the frontend)
+    base = PUBLIC_BASE_URL.rstrip("/")
+    if "onrender.com" in base:
+        return "https://zografia-backend.onrender.com"
+    return base.replace("zografia-ai", "zografia-backend")
 
 
-def _akool_start(image_public_url: str, prompt: str = "") -> dict:
+def _akool_create_talking_photo(image_url: str, audio_url: str, prompt: str = "") -> dict:
     if not AKOOL_API_KEY:
         raise HTTPException(status_code=503, detail="AKOOL_API_KEY not set")
     payload = {
-        "url": image_public_url,
-        "model_id": AKOOL_MODEL_ID,
-        "prompt": (prompt or "Gentle, subtle motion. Do not change colors, lines or style. No new objects, no zoom, no crop.")[:500],
-        "duration": 5,
+        "talking_photo_url": image_url,
+        "audio_url": audio_url,
+        "resolution": "720p",
     }
-    headers = {"Authorization": f"Bearer {AKOOL_API_KEY}", "Content-Type": "application/json"}
+    if prompt:
+        payload["prompt"] = prompt[:300]
+    headers = {"x-api-key": AKOOL_API_KEY, "Content-Type": "application/json"}
     try:
         with httpx.Client(timeout=30.0) as client:
-            r = client.post(f"{AKOOL_BASE}/content/video/createbyimage", json=payload, headers=headers)
-            r.raise_for_status()
-            return r.json() or {}
+            r = client.post(f"{AKOOL_BASE}/content/video/createbytalkingphoto",
+                            json=payload, headers=headers)
+            return r.json() if r.content else {}
     except httpx.HTTPError as e:
         print(f"[akool start] http error: {e!r}")
         raise HTTPException(status_code=502, detail=f"AKOOL start error: {type(e).__name__}")
 
 
-def _akool_status(task_id: str) -> dict:
+def _akool_status(video_model_id: str) -> dict:
     if not AKOOL_API_KEY:
         raise HTTPException(status_code=503, detail="AKOOL_API_KEY not set")
-    headers = {"Authorization": f"Bearer {AKOOL_API_KEY}"}
+    headers = {"x-api-key": AKOOL_API_KEY}
     try:
         with httpx.Client(timeout=20.0) as client:
             r = client.get(f"{AKOOL_BASE}/content/video/infobymodelid",
-                          params={"task_id": task_id}, headers=headers)
-            r.raise_for_status()
-            return r.json() or {}
+                           params={"video_model_id": video_model_id}, headers=headers)
+            return r.json() if r.content else {}
     except httpx.HTTPError as e:
         print(f"[akool status] http error: {e!r}")
         raise HTTPException(status_code=502, detail=f"AKOOL status error: {type(e).__name__}")
@@ -346,15 +367,18 @@ def health():
 
 @app.get("/api/animate-status")
 def animate_status(task_id: str):
-    """Poll AKOOL for a video task. Returns {status, video_url?, raw}."""
+    """Poll AKOOL for a talking-photo task. `task_id` here is the AKOOL `_id`.
+       Returns {status, video_url?, raw_code}."""
     if not task_id:
         raise HTTPException(status_code=400, detail="task_id required")
     data = _akool_status(task_id)
     body = (data.get("data") or {}) if isinstance(data, dict) else {}
     # AKOOL video_status: 1=queueing 2=processing 3=success 4=failed
-    vstat = body.get("video_status") or body.get("status") or 0
-    video_url = body.get("video") or body.get("video_url") or ""
-    state_str = {1: "queued", 2: "processing", 3: "success", 4: "failed"}.get(int(vstat) if vstat else 0, "unknown")
+    raw_vstat = body.get("video_status") if isinstance(body, dict) else 0
+    try: vstat = int(raw_vstat or 0)
+    except (TypeError, ValueError): vstat = 0
+    video_url = (body.get("video") or "") if isinstance(body, dict) else ""
+    state_str = {1: "queued", 2: "processing", 3: "success", 4: "failed"}.get(vstat, "unknown")
     return {
         "status": state_str,
         "video_url": video_url if state_str == "success" else "",
@@ -381,27 +405,19 @@ class TTSRequest(BaseModel):
     speed: Optional[float] = None
 
 
-@app.post("/api/tts")
-def tts(req: TTSRequest, x_device_id: Optional[str] = Header(None, alias="X-Device-Id")):
-    if x_device_id:
-        try: _require_device(x_device_id)
-        except HTTPException: pass
-
-    text = (req.text or "").strip()
+def _generate_tts_mp3(text: str, voice: str = DEFAULT_VOICE, speed: float = 0.95) -> bytes:
+    """Synchronously generate MP3 audio bytes from OpenAI TTS. Raises HTTPException on failure."""
+    text = (text or "").strip()
     if not text:
         raise HTTPException(status_code=400, detail="text is required")
     if len(text) > MAX_TTS_CHARS:
         text = text[:MAX_TTS_CHARS]
-
-    voice = (req.voice or DEFAULT_VOICE).strip().lower()
+    voice = (voice or DEFAULT_VOICE).strip().lower()
     if voice not in ALLOWED_VOICES:
         voice = DEFAULT_VOICE
-
-    speed = req.speed if req.speed is not None else 0.95
     try: speed = float(speed)
     except (TypeError, ValueError): speed = 0.95
     speed = max(0.5, min(1.5, speed))
-
     try:
         response = openai_client().audio.speech.create(
             model="tts-1",
@@ -410,13 +426,24 @@ def tts(req: TTSRequest, x_device_id: Optional[str] = Header(None, alias="X-Devi
             response_format="mp3",
             speed=speed,
         )
-        audio_bytes = response.read()
+        return response.read()
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
         print(f"[tts] error: {exc!r}")
         raise HTTPException(status_code=502, detail=f"TTS error: {type(exc).__name__}")
 
+
+@app.post("/api/tts")
+def tts(req: TTSRequest, x_device_id: Optional[str] = Header(None, alias="X-Device-Id")):
+    if x_device_id:
+        try: _require_device(x_device_id)
+        except HTTPException: pass
+    audio_bytes = _generate_tts_mp3(
+        req.text or "",
+        req.voice or DEFAULT_VOICE,
+        req.speed if req.speed is not None else 0.95,
+    )
     return StreamingResponse(
         io.BytesIO(audio_bytes),
         media_type="audio/mpeg",
@@ -580,29 +607,47 @@ def animate_drawing(req: AnimateRequest,
         _refund(x_device_id)
         raise HTTPException(status_code=502, detail=f"OpenAI: {type(exc).__name__}: {str(exc)[:280]}")
 
-    # --- kick off the AKOOL video in the SAME call so the frontend can start
-    # polling immediately. If AKOOL fails or isn't configured, we still return
-    # the story (talking + sparkles still work).
+    # --- generate the spoken audio ONCE here, save it to disk, return its URL.
+    # The frontend will play that file directly (so we don't pay for OpenAI TTS
+    # twice). The same URL is also handed to AKOOL.
+    out["audio_url"]     = ""
     out["video_task_id"] = ""
     out["video_status"]  = "none"
-    if AKOOL_API_KEY:
+
+    backend_host = _backend_origin()
+
+    audio_url = ""
+    try:
+        mp3_bytes = _generate_tts_mp3(out["speakable"])
+        audio_name = _save_bytes(mp3_bytes, "mp3")
+        audio_url = f"{backend_host}/uploads/{audio_name}"
+        out["audio_url"] = audio_url
+    except HTTPException as he:
+        print(f"[animate-drawing TTS] skipped: {he.detail}")
+    except Exception as exc:
+        print(f"[animate-drawing TTS] error: {exc!r}")
+
+    # --- kick off the AKOOL talking-photo video so the frontend can start
+    # polling immediately. If AKOOL fails or isn't configured, we still return
+    # the story + audio_url (the app works without video, just no animation).
+    if AKOOL_API_KEY and audio_url:
         try:
             img_name = _save_image_to_disk(image)
-            public_url = f"{PUBLIC_BASE_URL.replace('zografia-ai', 'zografia-backend')}/uploads/{img_name}.jpg"
-            # PUBLIC_BASE_URL points to the frontend; build the backend URL by
-            # swapping the host. (Fallback if user kept default config.)
-            backend_host = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
-            if backend_host:
-                public_url = f"{backend_host}/uploads/{img_name}.jpg"
-            elif "onrender.com" in PUBLIC_BASE_URL:
-                public_url = f"https://zografia-backend.onrender.com/uploads/{img_name}.jpg"
-            akool_resp = _akool_start(public_url, prompt=(out.get("what_i_see") or ""))
-            task_id = ""
+            image_url = f"{backend_host}/uploads/{img_name}"
+            akool_resp = _akool_create_talking_photo(
+                image_url=image_url,
+                audio_url=audio_url,
+                prompt=(out.get("what_i_see") or "")[:200],
+            )
+            video_model_id = ""
             if isinstance(akool_resp, dict):
                 body = akool_resp.get("data") or {}
-                task_id = body.get("task_id") or body.get("_id") or ""
-            if task_id:
-                out["video_task_id"] = task_id
+                # `_id` is what the get-result endpoint expects as `video_model_id`.
+                video_model_id = body.get("_id") or body.get("task_id") or ""
+                if (akool_resp.get("code") not in (1000, None)) and not video_model_id:
+                    print(f"[animate-drawing AKOOL] non-OK: {akool_resp}")
+            if video_model_id:
+                out["video_task_id"] = video_model_id
                 out["video_status"]  = "queued"
         except HTTPException as he:
             print(f"[animate-drawing AKOOL] skipped: {he.detail}")
