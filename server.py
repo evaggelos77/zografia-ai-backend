@@ -51,10 +51,14 @@ FULL_LIMIT  = 15  # per Stripe billing period (full monthly)
 YEARLY_LIMIT = 180  # full yearly cap (~15/month) — Phase 2 will offer top-ups
 
 AKOOL_API_KEY      = os.environ.get("AKOOL_API_KEY", "").strip()
-AKOOL_BASE         = "https://openapi.akool.com/api/open/v3"          # legacy talking-photo
-AKOOL_I2V_BASE     = "https://openapi.akool.com/api/open/v4/image2Video"  # image-to-video (preserve drawing)
+AKOOL_BASE         = "https://openapi.akool.com/api/open/v3"          # legacy
+AKOOL_I2V_BASE     = "https://openapi.akool.com/api/open/v4/image2Video"  # image-to-video
 AKOOL_RESOLUTION   = os.environ.get("AKOOL_RESOLUTION", "720p").strip() or "720p"
 AKOOL_VIDEO_LENGTH = int(os.environ.get("AKOOL_VIDEO_LENGTH", "5") or "5")
+# Cheap Akool Basic model = 4 credits/video at 720p. Premium models (Seedance,
+# MiniMax, Sora, Kling) cost ~100. Override via env if quality matters more.
+AKOOL_MODEL_NAME   = os.environ.get("AKOOL_MODEL_NAME", "AkoolImage2VideoFastV1").strip() \
+                     or "AkoolImage2VideoFastV1"
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL", "https://zografia-ai.onrender.com"
 ).rstrip("/")
@@ -356,22 +360,27 @@ def _strict_preservation_prompt(what_i_see: str = "") -> str:
 
 
 def _akool_create_image_to_video(image_url: str, what_i_see: str = "") -> dict:
-    """Kick off an Image-to-Video task. Returns AKOOL's raw JSON."""
+    """Kick off an Image-to-Video task via the BATCH endpoint with count=1.
+
+    The batch endpoint is the only one that accepts `model_name`, which lets
+    us pick the cheap Akool Basic model (4 credits/720p) instead of the
+    default premium model (100 credits) the single endpoint locks us into.
+    """
     if not AKOOL_API_KEY:
         raise HTTPException(status_code=503, detail="AKOOL_API_KEY not set")
     payload = {
         "image_url": image_url,
         "prompt": _strict_preservation_prompt(what_i_see),
         "negative_prompt": NEGATIVE_PROMPT,
+        "model_name": AKOOL_MODEL_NAME,
         "resolution": AKOOL_RESOLUTION,
-        "audio_type": 3,              # 1=AI / 2=user audio / 3=no audio in video
         "video_length": AKOOL_VIDEO_LENGTH,
-        "extend_prompt": False,
+        "count": 1,
     }
     headers = {"x-api-key": AKOOL_API_KEY, "Content-Type": "application/json"}
     try:
         with httpx.Client(timeout=30.0) as client:
-            r = client.post(f"{AKOOL_I2V_BASE}/createBySourcePrompt",
+            r = client.post(f"{AKOOL_I2V_BASE}/createBySourcePrompt/batch",
                             json=payload, headers=headers)
             return r.json() if r.content else {}
     except httpx.HTTPError as e:
@@ -689,7 +698,13 @@ def animate_drawing(req: AnimateRequest,
             video_id = ""
             if isinstance(akool_resp, dict):
                 body = akool_resp.get("data") or {}
-                video_id = body.get("_id") or ""
+                # Batch endpoint shape: data.successList[0]._id
+                slist = body.get("successList") if isinstance(body, dict) else None
+                if isinstance(slist, list) and slist and isinstance(slist[0], dict):
+                    video_id = slist[0].get("_id") or ""
+                # Fallback (single-create shape, if we ever switch back)
+                if not video_id and isinstance(body, dict):
+                    video_id = body.get("_id") or ""
                 if (akool_resp.get("code") not in (1000, None)) and not video_id:
                     print(f"[animate-drawing AKOOL] non-OK: {akool_resp}")
             if video_id:
