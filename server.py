@@ -50,8 +50,11 @@ BASIC_LIMIT = 5   # per Stripe billing period
 FULL_LIMIT  = 15  # per Stripe billing period (full monthly)
 YEARLY_LIMIT = 180  # full yearly cap (~15/month) — Phase 2 will offer top-ups
 
-AKOOL_API_KEY = os.environ.get("AKOOL_API_KEY", "").strip()
-AKOOL_BASE    = "https://openapi.akool.com/api/open/v3"
+AKOOL_API_KEY      = os.environ.get("AKOOL_API_KEY", "").strip()
+AKOOL_BASE         = "https://openapi.akool.com/api/open/v3"          # legacy talking-photo
+AKOOL_I2V_BASE     = "https://openapi.akool.com/api/open/v4/image2Video"  # image-to-video (preserve drawing)
+AKOOL_RESOLUTION   = os.environ.get("AKOOL_RESOLUTION", "720p").strip() or "720p"
+AKOOL_VIDEO_LENGTH = int(os.environ.get("AKOOL_VIDEO_LENGTH", "5") or "5")
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL", "https://zografia-ai.onrender.com"
 ).rstrip("/")
@@ -318,38 +321,76 @@ def _backend_origin() -> str:
     return base.replace("zografia-ai", "zografia-backend")
 
 
-def _akool_create_talking_photo(image_url: str, audio_url: str, prompt: str = "") -> dict:
+# --- Strict preservation prompt (from product spec PDF) ----------------------
+# Goal: subtle motion ONLY. AKOOL must NOT redesign, recolor or restyle the
+# child's drawing. Composed from a fixed preservation core + an optional
+# what_i_see hint from OpenAI Vision so motion suggestions match the picture.
+NEGATIVE_PROMPT = (
+    "no style change, no recolor, no new objects, no text overlay, no extra "
+    "effects, no character redesign, no warping, no morphing, no AI artifacts, "
+    "no extra characters, no background change, no camera zoom, no crop"
+)
+
+
+def _strict_preservation_prompt(what_i_see: str = "") -> str:
+    base = (
+        "Animate this real child drawing while fully preserving the original image, "
+        "original colors, original crayon style, original lines, and original "
+        "composition. Do not redesign, repaint, recolor, or restyle anything. "
+        "Keep the exact same characters, the same background, and the same overall drawing."
+    )
+    motion = (
+        " Only add gentle motion: characters move slightly as if happily standing or "
+        "playing together, arms move a little, bodies sway softly. Any sun or sky "
+        "elements have a subtle happy motion. Grass and small background details can "
+        "move slightly as if in a soft breeze."
+    )
+    tail = (
+        " Keep everything sweet, child-safe, simple, and natural. No new objects, "
+        "no style change, no extra effects, no text, 5 seconds."
+    )
+    if what_i_see:
+        clean = what_i_see.replace("\n", " ").strip()[:220]
+        return f"{base} The drawing shows: {clean}.{motion}{tail}"
+    return base + motion + tail
+
+
+def _akool_create_image_to_video(image_url: str, what_i_see: str = "") -> dict:
+    """Kick off an Image-to-Video task. Returns AKOOL's raw JSON."""
     if not AKOOL_API_KEY:
         raise HTTPException(status_code=503, detail="AKOOL_API_KEY not set")
     payload = {
-        "talking_photo_url": image_url,
-        "audio_url": audio_url,
-        "resolution": "720p",
+        "image_url": image_url,
+        "prompt": _strict_preservation_prompt(what_i_see),
+        "negative_prompt": NEGATIVE_PROMPT,
+        "resolution": AKOOL_RESOLUTION,
+        "audio_type": 3,              # 1=AI / 2=user audio / 3=no audio in video
+        "video_length": AKOOL_VIDEO_LENGTH,
+        "extend_prompt": False,
     }
-    if prompt:
-        payload["prompt"] = prompt[:300]
     headers = {"x-api-key": AKOOL_API_KEY, "Content-Type": "application/json"}
     try:
         with httpx.Client(timeout=30.0) as client:
-            r = client.post(f"{AKOOL_BASE}/content/video/createbytalkingphoto",
+            r = client.post(f"{AKOOL_I2V_BASE}/createBySourcePrompt",
                             json=payload, headers=headers)
             return r.json() if r.content else {}
     except httpx.HTTPError as e:
-        print(f"[akool start] http error: {e!r}")
+        print(f"[akool i2v start] http error: {e!r}")
         raise HTTPException(status_code=502, detail=f"AKOOL start error: {type(e).__name__}")
 
 
-def _akool_status(video_model_id: str) -> dict:
+def _akool_status(video_id: str) -> dict:
+    """Poll a single video by its _id. Returns AKOOL's raw JSON."""
     if not AKOOL_API_KEY:
         raise HTTPException(status_code=503, detail="AKOOL_API_KEY not set")
-    headers = {"x-api-key": AKOOL_API_KEY}
+    headers = {"x-api-key": AKOOL_API_KEY, "Content-Type": "application/json"}
     try:
         with httpx.Client(timeout=20.0) as client:
-            r = client.get(f"{AKOOL_BASE}/content/video/infobymodelid",
-                           params={"video_model_id": video_model_id}, headers=headers)
+            r = client.post(f"{AKOOL_I2V_BASE}/resultsByIds",
+                            json={"_ids": video_id}, headers=headers)
             return r.json() if r.content else {}
     except httpx.HTTPError as e:
-        print(f"[akool status] http error: {e!r}")
+        print(f"[akool i2v status] http error: {e!r}")
         raise HTTPException(status_code=502, detail=f"AKOOL status error: {type(e).__name__}")
 
 
@@ -367,17 +408,23 @@ def health():
 
 @app.get("/api/animate-status")
 def animate_status(task_id: str):
-    """Poll AKOOL for a talking-photo task. `task_id` here is the AKOOL `_id`.
+    """Poll AKOOL Image-to-Video for a task by its `_id`.
        Returns {status, video_url?, raw_code}."""
     if not task_id:
         raise HTTPException(status_code=400, detail="task_id required")
     data = _akool_status(task_id)
-    body = (data.get("data") or {}) if isinstance(data, dict) else {}
-    # AKOOL video_status: 1=queueing 2=processing 3=success 4=failed
-    raw_vstat = body.get("video_status") if isinstance(body, dict) else 0
+    # v4 shape: data.data.result[0] = {status, video_url, ...}
+    item = {}
+    if isinstance(data, dict):
+        body = data.get("data") or {}
+        if isinstance(body, dict):
+            arr = body.get("result") or []
+            if isinstance(arr, list) and arr:
+                item = arr[0] if isinstance(arr[0], dict) else {}
+    raw_vstat = item.get("status", 0)
     try: vstat = int(raw_vstat or 0)
     except (TypeError, ValueError): vstat = 0
-    video_url = (body.get("video") or "") if isinstance(body, dict) else ""
+    video_url = item.get("video_url") or ""
     state_str = {1: "queued", 2: "processing", 3: "success", 4: "failed"}.get(vstat, "unknown")
     return {
         "status": state_str,
@@ -627,27 +674,26 @@ def animate_drawing(req: AnimateRequest,
     except Exception as exc:
         print(f"[animate-drawing TTS] error: {exc!r}")
 
-    # --- kick off the AKOOL talking-photo video so the frontend can start
-    # polling immediately. If AKOOL fails or isn't configured, we still return
-    # the story + audio_url (the app works without video, just no animation).
-    if AKOOL_API_KEY and audio_url:
+    # --- kick off the AKOOL Image-to-Video task so the frontend can start
+    # polling immediately. We send the original drawing + a strict preservation
+    # prompt — AKOOL must NOT redesign or recolor the child's art, only add
+    # gentle motion. Audio is played in the browser, NOT mixed into the video.
+    if AKOOL_API_KEY:
         try:
             img_name = _save_image_to_disk(image)
             image_url = f"{backend_host}/uploads/{img_name}"
-            akool_resp = _akool_create_talking_photo(
+            akool_resp = _akool_create_image_to_video(
                 image_url=image_url,
-                audio_url=audio_url,
-                prompt=(out.get("what_i_see") or "")[:200],
+                what_i_see=out.get("what_i_see") or "",
             )
-            video_model_id = ""
+            video_id = ""
             if isinstance(akool_resp, dict):
                 body = akool_resp.get("data") or {}
-                # `_id` is what the get-result endpoint expects as `video_model_id`.
-                video_model_id = body.get("_id") or body.get("task_id") or ""
-                if (akool_resp.get("code") not in (1000, None)) and not video_model_id:
+                video_id = body.get("_id") or ""
+                if (akool_resp.get("code") not in (1000, None)) and not video_id:
                     print(f"[animate-drawing AKOOL] non-OK: {akool_resp}")
-            if video_model_id:
-                out["video_task_id"] = video_model_id
+            if video_id:
+                out["video_task_id"] = video_id
                 out["video_status"]  = "queued"
         except HTTPException as he:
             print(f"[animate-drawing AKOOL] skipped: {he.detail}")
