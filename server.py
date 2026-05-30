@@ -64,7 +64,10 @@ AKOOL_MODEL_NAME   = os.environ.get("AKOOL_MODEL_NAME", "AkoolImage2VideoFastV1"
 # lowercased emails. The user enters their email via /api/owner-unlock and if
 # it matches one in this set, their device's plan is upgraded to 'owner'.
 OWNER_EMAILS = {
-    e.strip().lower() for e in os.environ.get("OWNER_EMAILS", "events.topolytexno@gmail.com").split(",")
+    e.strip().lower() for e in os.environ.get(
+        "OWNER_EMAILS",
+        "events.topolytexno@gmail.com,info@evlabsai.gr,evaggelos77@gmail.com"
+    ).split(",")
     if e.strip()
 }
 PUBLIC_BASE_URL = os.environ.get(
