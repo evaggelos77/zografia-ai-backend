@@ -59,6 +59,14 @@ AKOOL_VIDEO_LENGTH = int(os.environ.get("AKOOL_VIDEO_LENGTH", "5") or "5")
 # MiniMax, Sora, Kling) cost ~100. Override via env if quality matters more.
 AKOOL_MODEL_NAME   = os.environ.get("AKOOL_MODEL_NAME", "AkoolImage2VideoFastV1").strip() \
                      or "AkoolImage2VideoFastV1"
+
+# Owners (events/presentations) get unlimited usage. Comma-separated list of
+# lowercased emails. The user enters their email via /api/owner-unlock and if
+# it matches one in this set, their device's plan is upgraded to 'owner'.
+OWNER_EMAILS = {
+    e.strip().lower() for e in os.environ.get("OWNER_EMAILS", "events.topolytexno@gmail.com").split(",")
+    if e.strip()
+}
 PUBLIC_BASE_URL = os.environ.get(
     "PUBLIC_BASE_URL", "https://zografia-ai.onrender.com"
 ).rstrip("/")
@@ -166,6 +174,7 @@ def _refresh_billing_period(dev: dict) -> dict:
 
 
 def _quota_for(plan: str) -> Optional[int]:
+    if plan == "owner":  return None     # unlimited (events/presentations)
     if plan == "yearly": return YEARLY_LIMIT
     if plan == "full":   return FULL_LIMIT
     if plan == "basic":  return BASIC_LIMIT
@@ -176,7 +185,7 @@ def _plan_status_dict(dev: dict) -> dict:
     plan = dev.get("plan") or "trial"
     status = dev.get("plan_status") or "active"
     is_active = status == "active"
-    is_paid = plan in ("basic", "full", "yearly") and is_active
+    is_paid = plan in ("basic", "full", "yearly", "owner") and is_active
     quota = _quota_for(plan if is_active else "trial")
     used = int(dev.get("uses") or 0)
     remaining = max(0, quota - used) if quota is not None else None
@@ -336,7 +345,7 @@ NEGATIVE_PROMPT = (
 )
 
 
-def _strict_preservation_prompt(what_i_see: str = "") -> str:
+def _strict_preservation_prompt(what_i_see: str = "", custom_motion: str = "") -> str:
     base = (
         "Animate this real child drawing while fully preserving the original image, "
         "original colors, original crayon style, original lines, and original "
@@ -353,13 +362,25 @@ def _strict_preservation_prompt(what_i_see: str = "") -> str:
         " Keep everything sweet, child-safe, simple, and natural. No new objects, "
         "no style change, no extra effects, no text, 5 seconds."
     )
+    parts = [base]
     if what_i_see:
-        clean = what_i_see.replace("\n", " ").strip()[:220]
-        return f"{base} The drawing shows: {clean}.{motion}{tail}"
-    return base + motion + tail
+        clean_see = what_i_see.replace("\n", " ").strip()[:220]
+        parts.append(f" The drawing shows: {clean_see}.")
+    parts.append(motion)
+    if custom_motion:
+        clean_motion = custom_motion.replace("\n", " ").strip()[:240]
+        # Wrap the user's request so AKOOL still respects preservation: the parent's
+        # hint becomes a motion *suggestion*, never a redesign instruction.
+        parts.append(
+            f" Parent's gentle motion hint (respect it as motion only, never as "
+            f"a redesign): {clean_motion}."
+        )
+    parts.append(tail)
+    return "".join(parts)
 
 
-def _akool_create_image_to_video(image_url: str, what_i_see: str = "") -> dict:
+def _akool_create_image_to_video(image_url: str, what_i_see: str = "",
+                                 custom_motion: str = "") -> dict:
     """Kick off an Image-to-Video task via the BATCH endpoint with count=1.
 
     The batch endpoint is the only one that accepts `model_name`, which lets
@@ -370,7 +391,7 @@ def _akool_create_image_to_video(image_url: str, what_i_see: str = "") -> dict:
         raise HTTPException(status_code=503, detail="AKOOL_API_KEY not set")
     payload = {
         "image_url": image_url,
-        "prompt": _strict_preservation_prompt(what_i_see),
+        "prompt": _strict_preservation_prompt(what_i_see, custom_motion),
         "negative_prompt": NEGATIVE_PROMPT,
         "model_name": AKOOL_MODEL_NAME,
         "resolution": AKOOL_RESOLUTION,
@@ -516,6 +537,35 @@ class AnimateRequest(BaseModel):
     child_name: Optional[str] = None
     title: Optional[str] = None
     mood: Optional[str] = None              # "χαρούμενο" | "ήρεμο" | "παιχνιδιάρικο"
+    custom_motion: Optional[str] = None     # optional Greek hint, e.g. "ο ήλιος να χαμογελάει"
+
+
+class OwnerUnlockRequest(BaseModel):
+    email: str
+
+
+@app.post("/api/owner-unlock")
+def owner_unlock(req: OwnerUnlockRequest,
+                 x_device_id: Optional[str] = Header(None, alias="X-Device-Id")):
+    """Marks the calling device as 'owner' (unlimited usage) if the supplied
+    email is on the OWNER_EMAILS allow-list. For event/presentation use by
+    the platform owner only — not exposed in marketing UI."""
+    dev = _require_device(x_device_id)
+    email = (req.email or "").strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail="email required")
+    if email not in OWNER_EMAILS:
+        # Don't reveal whether the email is in the list or not — generic 403
+        raise HTTPException(status_code=403, detail="not_allowed")
+    with db() as con:
+        con.execute(
+            """UPDATE devices SET plan='owner', plan_status='active',
+                   uses=0, period_start=?, current_period_end=0, updated_at=?
+               WHERE id=?""",
+            (_now(), _now(), dev["id"]),
+        )
+        row = con.execute("SELECT * FROM devices WHERE id=?", (dev["id"],)).fetchone()
+    return _plan_status_dict(dict(row))
 
 
 SYSTEM_PROMPT_ANIMATE = (
@@ -694,6 +744,7 @@ def animate_drawing(req: AnimateRequest,
             akool_resp = _akool_create_image_to_video(
                 image_url=image_url,
                 what_i_see=out.get("what_i_see") or "",
+                custom_motion=(req.custom_motion or "").strip(),
             )
             video_id = ""
             if isinstance(akool_resp, dict):
