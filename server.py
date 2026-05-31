@@ -541,6 +541,7 @@ class AnimateRequest(BaseModel):
     title: Optional[str] = None
     mood: Optional[str] = None              # "χαρούμενο" | "ήρεμο" | "παιχνιδιάρικο"
     custom_motion: Optional[str] = None     # optional Greek hint, e.g. "ο ήλιος να χαμογελάει"
+    lang: Optional[str] = "el"              # "el" (default) or "en" — controls story + voice
 
 
 class OwnerUnlockRequest(BaseModel):
@@ -571,7 +572,7 @@ def owner_unlock(req: OwnerUnlockRequest,
     return _plan_status_dict(dict(row))
 
 
-SYSTEM_PROMPT_ANIMATE = (
+SYSTEM_PROMPT_ANIMATE_EL = (
     "Είσαι μια χαρούμενη και ασφαλής Ελληνίδα αφηγήτρια παιδικών παραμυθιών.\n"
     "Σου δείχνουν μια ζωγραφιά παιδιού. Πρέπει να τη «ζωντανέψεις» — να γράψεις\n"
     "ένα μικρό μαγικό κείμενο (3–5 προτάσεις) και 2–3 σύντομα «λόγια» που θα πει\n"
@@ -585,7 +586,7 @@ SYSTEM_PROMPT_ANIMATE = (
     "- Αν δεν είσαι σίγουρη τι είναι κάτι, πες το ευγενικά («μου φαίνεται σαν…»).\n"
     "- Απάντησε ΜΟΝΟ με έγκυρο JSON ακριβώς αυτής της δομής:"
 )
-JSON_SHAPE_ANIMATE = (
+JSON_SHAPE_ANIMATE_EL = (
     '{\n'
     '  "title": "Σύντομος τίτλος (έως 6 λέξεις)",\n'
     '  "what_i_see": "Σύντομη ανθρώπινη περιγραφή του τι βλέπω.",\n'
@@ -599,6 +600,39 @@ JSON_SHAPE_ANIMATE = (
     '}'
 )
 
+SYSTEM_PROMPT_ANIMATE_EN = (
+    "You are a cheerful, gentle storyteller for young children.\n"
+    "A child's drawing has been shared with you. Your job is to 'bring it to\n"
+    "life' — write a short magical paragraph (3–5 sentences) and 2–3 short\n"
+    "lines that the drawing would say to the child.\n\n"
+    "Rules:\n"
+    "- EVERYTHING in English, simple words, warm, like a friend.\n"
+    "- Safe, joyful, playful. Never anything scary, violent or inappropriate.\n"
+    "- If a child name is provided, use it once, naturally.\n"
+    "- Praise the work kindly (\"I love how you drew…\"). No empty flattery.\n"
+    "- Briefly describe what you see in the drawing (simple, recognizable parts).\n"
+    "- If unsure what something is, say so gently (\"it looks like a…\").\n"
+    "- Respond ONLY with valid JSON of exactly this shape:"
+)
+JSON_SHAPE_ANIMATE_EN = (
+    '{\n'
+    '  "title": "Short title (up to 6 words)",\n'
+    '  "what_i_see": "Short human description of what I see.",\n'
+    '  "story": "3–5 sentences. Magical, warm, narrative.",\n'
+    '  "lines": [\n'
+    '    {"speaker": "e.g. the sun", "text": "1 short sentence the sun says to the child"},\n'
+    '    {"speaker": "e.g. the dog", "text": "Another short sentence"}\n'
+    '  ],\n'
+    '  "mood": "happy | calm | playful | magical",\n'
+    '  "follow_up": "A warm question for the child (e.g. \\"Where do you think the sun is going next?\\")"\n'
+    '}'
+)
+
+
+def _system_and_shape(lang: str):
+    return (SYSTEM_PROMPT_ANIMATE_EN, JSON_SHAPE_ANIMATE_EN) if (lang or "").lower() == "en" \
+           else (SYSTEM_PROMPT_ANIMATE_EL, JSON_SHAPE_ANIMATE_EL)
+
 
 def _extract_json(text: str) -> dict:
     text = (text or "").strip()
@@ -610,25 +644,36 @@ def _extract_json(text: str) -> dict:
         raise
 
 
-def _validate_animation(obj: dict) -> dict:
+def _validate_animation(obj: dict, lang: str = "el") -> dict:
     if not isinstance(obj, dict): raise ValueError("not an object")
     story = (obj.get("story") or "").strip()
     if not story: raise ValueError("missing story")
     lines = obj.get("lines") or []
     if not isinstance(lines, list): lines = []
+    # Language-appropriate default speakers / fallback lines
+    if (lang or "el").lower() == "en":
+        default_speaker = "the drawing"
+        default_line    = "Hi! You drew me beautifully!"
+        default_title   = "My drawing"
+        default_mood    = "happy"
+    else:
+        default_speaker = "η ζωγραφιά"
+        default_line    = "Γεια σου! Με ζωγράφισες πολύ ωραία!"
+        default_title   = "Η ζωγραφιά μου"
+        default_mood    = "χαρούμενο"
     cleaned_lines = []
     for ln in lines[:5]:
         if not isinstance(ln, dict): continue
         sp = str(ln.get("speaker") or "").strip()
         tx = str(ln.get("text") or "").strip()
         if not tx: continue
-        cleaned_lines.append({"speaker": sp[:60] or "η ζωγραφιά", "text": tx[:280]})
+        cleaned_lines.append({"speaker": sp[:60] or default_speaker, "text": tx[:280]})
     return {
-        "title":      (str(obj.get("title") or "").strip() or "Η ζωγραφιά μου")[:80],
+        "title":      (str(obj.get("title") or "").strip() or default_title)[:80],
         "what_i_see": str(obj.get("what_i_see") or "").strip()[:400],
         "story":      story[:1200],
-        "lines":      cleaned_lines or [{"speaker": "η ζωγραφιά", "text": "Γεια σου! Με ζωγράφισες πολύ ωραία!"}],
-        "mood":       (str(obj.get("mood") or "χαρούμενο").strip().lower())[:30],
+        "lines":      cleaned_lines or [{"speaker": default_speaker, "text": default_line}],
+        "mood":       (str(obj.get("mood") or default_mood).strip().lower())[:30],
         "follow_up":  str(obj.get("follow_up") or "").strip()[:280],
     }
 
@@ -676,25 +721,32 @@ def animate_drawing(req: AnimateRequest,
     child = (req.child_name or "").strip()[:40]
     title = (req.title or "").strip()[:80]
     mood  = (req.mood or "").strip()[:20]
+    lang  = (req.lang or "el").strip().lower()
+    if lang not in ("el", "en"): lang = "el"
+    sys_prompt, json_shape = _system_and_shape(lang)
 
     extra_bits = []
-    if child:  extra_bits.append(f"Όνομα παιδιού: {child}.")
-    if title:  extra_bits.append(f"Τίτλος ζωγραφιάς (αν σε βοηθάει): {title}.")
-    if mood:   extra_bits.append(f"Επιθυμητή διάθεση: {mood}.")
+    if lang == "en":
+        if child: extra_bits.append(f"Child's name: {child}.")
+        if title: extra_bits.append(f"Drawing title (if it helps): {title}.")
+        if mood:  extra_bits.append(f"Desired mood: {mood}.")
+        opener  = "Look at this child's drawing and bring it to life."
+        reminder = "\n\nReply ONLY with JSON of this shape:\n"
+    else:
+        if child: extra_bits.append(f"Όνομα παιδιού: {child}.")
+        if title: extra_bits.append(f"Τίτλος ζωγραφιάς (αν σε βοηθάει): {title}.")
+        if mood:  extra_bits.append(f"Επιθυμητή διάθεση: {mood}.")
+        opener  = "Δες αυτή τη ζωγραφιά παιδιού και ζωντάνεψέ τη."
+        reminder = "\n\nΑπάντησε ΜΟΝΟ με JSON αυτής της δομής:\n"
     extra_block = ("\n" + "\n".join(extra_bits)) if extra_bits else ""
 
-    user_prompt = (
-        "Δες αυτή τη ζωγραφιά παιδιού και ζωντάνεψέ τη.\n"
-        + extra_block
-        + "\n\nΑπάντησε ΜΟΝΟ με JSON αυτής της δομής:\n"
-        + JSON_SHAPE_ANIMATE
-    )
+    user_prompt = opener + extra_block + reminder + json_shape
 
     try:
         completion = openai_client().chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": SYSTEM_PROMPT_ANIMATE},
+                {"role": "system", "content": sys_prompt},
                 {"role": "user", "content": [
                     {"type": "text", "text": user_prompt},
                     {"type": "image_url", "image_url": {"url": image, "detail": "low"}},
@@ -706,9 +758,10 @@ def animate_drawing(req: AnimateRequest,
         )
         raw = completion.choices[0].message.content or ""
         data = _extract_json(raw)
-        out = _validate_animation(data)
+        out = _validate_animation(data, lang)
         out["speakable"] = _speakable_full_text(out)
         out["usage"]     = _plan_status_dict(dev_after)
+        out["lang"]      = lang
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
