@@ -45,10 +45,13 @@ from pydantic import BaseModel
 DB_PATH = os.environ.get("DB_PATH", "/var/data/zografia.db")
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", "/var/data/uploads")
 
-TRIAL_LIMIT = 2
-BASIC_LIMIT = 5   # per Stripe billing period
-FULL_LIMIT  = 15  # per Stripe billing period (full monthly)
-YEARLY_LIMIT = 180  # full yearly cap (~15/month) — Phase 2 will offer top-ups
+# Quotas rebalanced now that AKOOL Image-to-Video runs on AkoolImage2VideoFastV1
+# at ~4 credits per 720p / 5s video (was ~100 cr on the default premium model).
+# Headroom lets us be much more generous at the same Stripe price points.
+TRIAL_LIMIT  = 3      # was 2  — gives parents one more "wow" before paywall
+BASIC_LIMIT  = 15     # was 5  — ~1 video every other day, comfortable for casual use
+FULL_LIMIT   = 50     # was 15 — ~1-2 videos per day, "no worries" tier
+YEARLY_LIMIT = 600    # was 180 — ~50/month, matches Full monthly cadence
 
 AKOOL_API_KEY      = os.environ.get("AKOOL_API_KEY", "").strip()
 AKOOL_BASE         = "https://openapi.akool.com/api/open/v3"          # legacy
