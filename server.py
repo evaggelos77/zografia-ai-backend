@@ -442,6 +442,41 @@ def health():
     }
 
 
+@app.get("/api/download-video")
+def download_video_proxy(url: str):
+    """Proxy AKOOL CDN videos back to the client with
+    Content-Disposition: attachment so the browser triggers a real Save
+    dialog with the right .mp4 filename. Bypasses Windows Media Player
+    quirks where the same file fetched directly fails to open.
+
+    Whitelisted to AKOOL CDN hosts only so we can't be used as an open
+    redirect / bandwidth abuse target."""
+    if not isinstance(url, str) or not url.startswith("https://"):
+        raise HTTPException(status_code=400, detail="https url required")
+    allowed_hosts = ("cloudfront.net", "akool.com", "akoolai.com")
+    if not any(h in url for h in allowed_hosts):
+        raise HTTPException(status_code=400, detail="untrusted host")
+    try:
+        with httpx.Client(timeout=60.0, follow_redirects=True) as client:
+            r = client.get(url)
+            r.raise_for_status()
+            return StreamingResponse(
+                io.BytesIO(r.content),
+                media_type="video/mp4",
+                headers={
+                    "Content-Disposition": 'attachment; filename="zografia-zoi.mp4"',
+                    "Cache-Control": "no-store",
+                    "Content-Length": str(len(r.content)),
+                },
+            )
+    except httpx.HTTPError as e:
+        print(f"[download-video] http err: {e!r}")
+        raise HTTPException(status_code=502, detail=f"fetch failed: {type(e).__name__}")
+    except Exception as e:  # noqa: BLE001
+        print(f"[download-video] err: {e!r}")
+        raise HTTPException(status_code=502, detail="fetch failed")
+
+
 @app.get("/api/animate-status")
 def animate_status(task_id: str):
     """Poll AKOOL Image-to-Video for a task by its `_id`.
