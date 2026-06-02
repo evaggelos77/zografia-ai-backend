@@ -334,15 +334,15 @@ def get_upload(filename: str):
 
 
 def _backend_origin() -> str:
-    """Public origin for our uploads/* files (AKOOL needs HTTPS URLs)."""
+    """Public origin for our uploads/* files (AKOOL needs HTTPS URLs).
+
+    Hard-coded to the backend's own .onrender.com hostname so AKOOL can
+    always reach /uploads/* — regardless of what PUBLIC_BASE_URL points to
+    on the frontend (zografiazoi.com, zografia-ai.onrender.com, …)."""
     explicit = os.environ.get("BACKEND_PUBLIC_URL", "").rstrip("/")
     if explicit:
         return explicit
-    # Derive from PUBLIC_BASE_URL (which points at the frontend)
-    base = PUBLIC_BASE_URL.rstrip("/")
-    if "onrender.com" in base:
-        return "https://zografia-backend.onrender.com"
-    return base.replace("zografia-ai", "zografia-backend")
+    return "https://zografia-backend.onrender.com"
 
 
 # --- Strict preservation prompt (from product spec PDF) ----------------------
