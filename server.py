@@ -90,6 +90,8 @@ STRIPE_WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET", "").strip()
 app = FastAPI(title="Ζωγραφιά με Ζωή AI backend", version="1.0.0")
 
 ALLOWED_ORIGINS = [
+    "https://zografiazoi.com",
+    "https://www.zografiazoi.com",
     "https://zografia-ai.onrender.com",
     "https://zografia.onrender.com",
     "https://evlabsai.gr",
